@@ -161,7 +161,7 @@ class ModelViewSetTests(TestBase):
 
         response = self.client.patch(self.detail_url, data=data)
 
-        self.assertEqual(response.status_code, 400)
+        assert response.status_code == 400, response.content.decode()
 
     def test_patch_requires_correct_id(self):
         """
