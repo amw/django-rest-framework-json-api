@@ -97,23 +97,6 @@ class TestJSONParser:
             parse(data)
         assert "Received document does not contain primary data" == str(excinfo.value)
 
-    def test_parse_fails_on_list_of_objects(self, parse):
-        data = {
-            "data": [
-                {
-                    "type": "BasicModel",
-                    "attributes": {"json-value": {"JsonKey": "JsonValue"}},
-                }
-            ],
-        }
-
-        with pytest.raises(ParseError) as excinfo:
-            parse(data)
-
-        assert "Received data is not a valid JSONAPI Resource Identifier Object" == str(
-            excinfo.value
-        )
-
     def test_parse_fails_when_id_is_missing_on_patch(self, rf, parse, parser_context):
         parser_context["request"] = rf.patch("/")
         data = {
@@ -125,6 +108,6 @@ class TestJSONParser:
         with pytest.raises(ParseError) as excinfo:
             parse(data)
 
-        assert "The resource identifier object must contain an 'id' member" == str(
+        assert "The resource object must contain an 'id' member" == str(
             excinfo.value
         )
