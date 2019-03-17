@@ -11,6 +11,7 @@ from django.db.models.fields.related_descriptors import (
     ManyToManyDescriptor,
     ReverseManyToOneDescriptor
 )
+from django.http import Http404
 from django.utils import encoding, six
 from django.utils.module_loading import import_string as import_class_from_dotted_path
 from django.utils.translation import ugettext_lazy as _
@@ -413,7 +414,9 @@ def format_drf_errors(response, context, exc):
                 errors.append(error)
             elif isinstance(error, six.string_types):
                 classes = inspect.getmembers(exceptions, inspect.isclass)
+                classes.append(['Http404', Http404])
                 # DRF sets the `field` to 'detail' for its own exceptions
+                # and some Django excpetions
                 if isinstance(exc, tuple(x[1] for x in classes)):
                     pointer = '/data'
                 errors.append({
