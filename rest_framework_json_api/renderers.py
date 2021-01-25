@@ -375,9 +375,11 @@ class JSONRenderer(renderers.JSONRenderer):
                             resource_type,
                             getattr(serializer, "_poly_force_type_resolution", False),
                         )
-                        included_cache[new_item["type"]][
-                            new_item["id"]
-                        ] = utils.format_field_names(new_item)
+                        new_item = utils.format_field_names(new_item)
+                        meta = cls.extract_meta(serializer, serializer_resource)
+                        if meta:
+                            new_item["meta"] = utils.format_field_names(meta)
+                        included_cache[new_item["type"]][new_item["id"]] = new_item
                         cls.extract_included(
                             serializer_fields,
                             serializer_resource,
@@ -399,9 +401,11 @@ class JSONRenderer(renderers.JSONRenderer):
                         relation_type,
                         getattr(field, "_poly_force_type_resolution", False),
                     )
-                    included_cache[new_item["type"]][
-                        new_item["id"]
-                    ] = utils.format_field_names(new_item)
+                    new_item = utils.format_field_names(new_item)
+                    meta = cls.extract_meta(field, serializer_data)
+                    if meta:
+                        new_item["meta"] = utils.format_field_names(meta)
+                    included_cache[new_item["type"]][new_item["id"]] = new_item
                     cls.extract_included(
                         serializer_fields,
                         serializer_data,
