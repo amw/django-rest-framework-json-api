@@ -5,6 +5,7 @@ from rest_framework import parsers
 from rest_framework.exceptions import ParseError
 
 from rest_framework_json_api import exceptions, renderers, serializers
+from rest_framework_json_api.serializers import ResourceIdentifierObjectSerializer
 from rest_framework_json_api.utils import get_resource_name, undo_format_field_names
 
 
@@ -73,6 +74,29 @@ class JSONParser(parsers.JSONParser):
     def parse(self, stream, media_type=None, parser_context=None):
         """
         Parses the incoming bytestream as JSON and returns the resulting data
+
+        There are two basic object types in JSON-API.
+
+        1. Resource Identifier Object
+
+        They only have "id" and "type" keys (optionally also "meta"). The "type"
+        should be passed to the views for processing. These objects are used in
+        "relationships" keys and also as the actual "data" in Relationship URLs.
+
+        2. Resource Objects
+
+        They use the keys as above plus optional "attributes" and
+        "relationships". Attributes and relationships should be flattened before
+        sending to views and the "type" key should be removed.
+
+        We support requests with list data. In JSON-API list data can be found
+        in Relationship URLs where we would expect Resource Identifier Objects,
+        but we will also allow lists of Resource Objects as the users might want
+        to implement bulk operations in their custom views.
+
+        In addition True, False and None will be accepted as data and passed to
+        views. In JSON-API None is a valid data for 1-to-1 Relationship URLs and
+        indicates that the relationship should be cleared.
         """
         result = super().parse(
             stream, media_type=media_type, parser_context=parser_context
@@ -84,43 +108,63 @@ class JSONParser(parsers.JSONParser):
         data = result.get("data")
         parser_context = parser_context or {}
         view = parser_context.get("view")
-
-        from rest_framework_json_api.views import RelationshipView
-
-        if isinstance(view, RelationshipView):
-            # We skip parsing the object as JSON:API Resource Identifier Object and not a regular
-            # Resource Object
-            if isinstance(data, list):
-                for resource_identifier_object in data:
-                    if not (
-                        resource_identifier_object.get("id")
-                        and resource_identifier_object.get("type")
-                    ):
-                        raise ParseError(
-                            "Received data contains one or more malformed JSON:API "
-                            "Resource Identifier Object(s)"
-                        )
-            elif not (data.get("id") and data.get("type")):
-                raise ParseError(
-                    "Received data is not a valid JSON:API Resource Identifier Object"
-                )
-
-            return data
-
+        resource_name = get_resource_name(parser_context, expand_polymorphic_types=True)
         request = parser_context.get("request")
         method = request and request.method
+        serializer_class = getattr(view, "serializer_class", None)
+        in_relationship_view = serializer_class == ResourceIdentifierObjectSerializer
 
-        # Sanity check
-        if not isinstance(data, dict):
-            raise ParseError(
-                "Received data is not a valid JSON:API Resource Identifier Object"
-            )
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    err = 'Items in data array must be objects with "id" and "type" members.'
+                    raise ParseError(err)
 
+            if in_relationship_view:
+                for identifier in data:
+                    self.verify_resource_identifier(identifier)
+                return data
+            else:
+                return list(
+                    self.parse_resource(d, d, resource_name, method, serializer_class)
+                    for d in data
+                )
+        elif isinstance(data, dict):
+            if in_relationship_view:
+                self.verify_resource_identifier(data)
+                return data
+            else:
+                parsed = self.parse_resource(
+                    data, result, resource_name, method, serializer_class
+                )
+
+                if method in ("PATCH", "PUT"):
+                    lookup_url_kwarg = getattr(
+                        view, "lookup_url_kwarg", None
+                    ) or getattr(view, "lookup_field", None)
+                    if lookup_url_kwarg and str(data.get("id")) != str(
+                        view.kwargs[lookup_url_kwarg]
+                    ):
+                        raise exceptions.Conflict(
+                            "The resource object's id ({data_id}) does not match url's "
+                            "lookup id ({url_id})".format(
+                                data_id=data.get("id"),
+                                url_id=view.kwargs[lookup_url_kwarg],
+                            )
+                        )
+
+                return parsed
+        elif in_relationship_view:
+            raise AttributeError("compatibility with upstream")
+        else:
+            # None, True, False, numbers and strings
+            return data
+
+    def parse_resource(
+        self, data, meta_source, resource_name, method, serializer_class
+    ):
         # Check for inconsistencies
         if method in ("PUT", "POST", "PATCH"):
-            resource_name = get_resource_name(
-                parser_context, expand_polymorphic_types=True
-            )
             if isinstance(resource_name, str):
                 if data.get("type") != resource_name:
                     raise exceptions.Conflict(
@@ -141,26 +185,9 @@ class JSONParser(parsers.JSONParser):
                         )
                     )
         if not data.get("id") and method in ("PATCH", "PUT"):
-            raise ParseError(
-                "The resource identifier object must contain an 'id' member"
-            )
-
-        if method in ("PATCH", "PUT"):
-            lookup_url_kwarg = getattr(view, "lookup_url_kwarg", None) or getattr(
-                view, "lookup_field", None
-            )
-            if lookup_url_kwarg and str(data.get("id")) != str(
-                view.kwargs[lookup_url_kwarg]
-            ):
-                raise exceptions.Conflict(
-                    "The resource object's id ({data_id}) does not match url's "
-                    "lookup id ({url_id})".format(
-                        data_id=data.get("id"), url_id=view.kwargs[lookup_url_kwarg]
-                    )
-                )
+            raise ParseError("The resource object must contain an 'id' member")
 
         # Construct the return data
-        serializer_class = getattr(view, "serializer_class", None)
         parsed_data = {"id": data.get("id")} if "id" in data else {}
         # TODO remove in next major version 5.0.0 see serializers.ReservedFieldNamesMixin
         if serializer_class is not None:
@@ -168,5 +195,11 @@ class JSONParser(parsers.JSONParser):
                 parsed_data["type"] = data.get("type")
         parsed_data.update(self.parse_attributes(data))
         parsed_data.update(self.parse_relationships(data))
-        parsed_data.update(self.parse_metadata(result))
+        parsed_data.update(self.parse_metadata(meta_source))
         return parsed_data
+
+    def verify_resource_identifier(self, data):
+        if not data.get("id") or not data.get("type"):
+            raise ParseError(
+                "Received data is not a valid JSON:API Resource Identifier Object(s)."
+            )
