@@ -6,7 +6,10 @@ from rest_framework import parsers
 from rest_framework.exceptions import ParseError
 
 from rest_framework_json_api import exceptions, renderers
-from rest_framework_json_api.serializers import ResourceIdentifierObjectSerializer
+from rest_framework_json_api.serializers import (
+    PolymorphicModelSerializer,
+    ResourceIdentifierObjectSerializer,
+)
 from rest_framework_json_api.utils import get_resource_name, undo_format_field_names
 
 
@@ -186,7 +189,10 @@ class JSONParser(parsers.JSONParser):
 
         # Construct the return data
         parsed_data = {"id": data.get("id")} if "id" in data else {}
-        parsed_data["type"] = data.get("type")
+        # TODO Remove conditions when we stop using 'type' fields in our serializers
+        if serializer_class is not None:
+            if issubclass(serializer_class, PolymorphicModelSerializer):
+                parsed_data["type"] = data.get("type")
         parsed_data.update(self.parse_attributes(data))
         parsed_data.update(self.parse_relationships(data))
         parsed_data.update(self.parse_metadata(meta_source))
