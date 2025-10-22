@@ -176,8 +176,6 @@ class TestResourceIdentifierObjectSerializer(TestCase):
 
         self.assertTrue(serializer.is_valid(), msg=serializer.errors)
 
-        print(serializer.data)
-
 
 class TestModelSerializer:
     def test_model_serializer_with_implicit_fields(self, comment, client):

@@ -2,8 +2,8 @@ import pytest
 from django.contrib.auth import get_user_model
 
 from rest_framework_json_api import serializers
-from rest_framework_json_api.renderers import JSONRenderer
-from rest_framework_json_api.utils import get_serializer_fields
+from rest_framework_json_api.renderers import IncludedCache, JSONRenderer
+from rest_framework_json_api.utils import get_resource_id, get_serializer_fields
 
 pytestmark = pytest.mark.django_db
 
@@ -38,9 +38,12 @@ def test_build_json_resource_obj():
         JSONRenderer.build_json_resource_obj(
             get_serializer_fields(serializer),
             resource,
-            resource_instance,
+            get_resource_id(resource_instance, resource),
             "user",
+            resource_instance,
             serializer,
+            [],
+            IncludedCache(),
         )
         == output
     )
@@ -73,17 +76,35 @@ def test_can_override_methods():
             return super().extract_attributes(fields, resource)
 
         @classmethod
-        def extract_relationships(cls, fields, resource, resource_instance):
+        def extract_relationships(
+            cls,
+            serializer,
+            fields,
+            resource,
+            instance,
+            included_resources,
+            included_cache,
+        ):
             cls.extract_relationships_was_overriden = True
-            return super().extract_relationships(fields, resource, resource_instance)
+            return super().extract_relationships(
+                serializer,
+                fields,
+                resource,
+                instance,
+                included_resources,
+                included_cache,
+            )
 
     assert (
         CustomRenderer.build_json_resource_obj(
             get_serializer_fields(serializer),
             resource,
-            resource_instance,
+            get_resource_id(resource_instance, resource),
             "user",
+            resource_instance,
             serializer,
+            [],
+            IncludedCache(),
         )
         == output
     )
