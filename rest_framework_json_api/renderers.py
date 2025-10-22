@@ -2,9 +2,10 @@
 Renderers
 """
 
-import copy
-from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from typing import Any
 
 from django.db.models import Manager
 from django.template import loader
@@ -12,10 +13,8 @@ from django.utils.encoding import force_str
 from rest_framework import relations, renderers
 from rest_framework.fields import SkipField, get_attribute
 from rest_framework.relations import PKOnlyObject
-from rest_framework.serializers import ListSerializer, Serializer
 from rest_framework.settings import api_settings
 
-import rest_framework_json_api
 from rest_framework_json_api.relations import (
     HyperlinkedMixin,
     ManySerializerMethodResourceRelatedField,
@@ -36,6 +35,34 @@ from rest_framework_json_api.utils import (
     get_serializer_fields,
     is_relationship_field,
 )
+
+
+@dataclass
+class IncludedCache:
+    by_id: dict[tuple[str, str], Any] = dataclass_field(default_factory=dict)
+
+    def add(self, resource):
+        resource_type = resource.get("type")
+        id = resource.get("id")
+        if resource_type is None or id is None:
+            return
+        self.by_id[(resource_type, id)] = resource
+
+    def check(self, resource):
+        resource_type = resource.get("type")
+        id = resource.get("id")
+        return self.get(resource_type, id) is not None
+
+    def get(self, resource_type, id):
+        return self.by_id.get((resource_type, id))
+
+    def remove(self, resource):
+        """Used for deduplicating resources already present in main `data`."""
+        resource_type = resource.get("type")
+        id = resource.get("id")
+        key = (resource_type, id)
+        if key in self.by_id:
+            del self.by_id[key]
 
 
 class JSONRenderer(renderers.JSONRenderer):
@@ -83,18 +110,20 @@ class JSONRenderer(renderers.JSONRenderer):
         }
 
     @classmethod
-    def extract_relationships(cls, fields, resource, resource_instance):
+    def extract_relationships(
+        cls, serializer, fields, resource, instance, included_resources, included_cache
+    ):
         """
         Builds the relationships top level object based on related serializers.
+        Also extracts included resources in a single pass through the fields.
         """
-        # Avoid circular deps
-        from rest_framework_json_api.relations import ResourceRelatedField
-
         data = {}
 
         # Don't try to extract relationships from a non-existent resource
-        if resource_instance is None:
+        if instance is None:
             return
+
+        included_serializers = getattr(serializer, "included_serializers", dict())
 
         for field_name, field in iter(fields.items()):
             # Skip URL field
@@ -111,15 +140,17 @@ class JSONRenderer(renderers.JSONRenderer):
 
             source = field.source
             relation_type = get_related_resource_type(field)
+            relation_instance = None
+            relation_data = None
+            relation_meta = None
+            relation_links = None
 
             if isinstance(field, relations.HyperlinkedIdentityField):
                 resolved, relation_instance = get_relation_instance(
-                    resource_instance, source, field.parent
+                    instance, source, field.parent
                 )
                 if not resolved:
                     continue
-                # special case for HyperlinkedIdentityField
-                relation_data = list()
 
                 # Don't try to query an empty relation
                 relation_queryset = (
@@ -130,50 +161,33 @@ class JSONRenderer(renderers.JSONRenderer):
                     {"type": relation_type, "id": force_str(related_object.pk)}
                     for related_object in relation_queryset
                 ]
-                data.update(
-                    {
-                        field_name: {
-                            "links": {"related": resource.get(field_name)},
-                            "data": relation_data,
-                            "meta": {"count": len(relation_data)},
-                        }
-                    }
+                relation_links = {"related": resource.get(field_name)}
+                relation_meta = {"count": len(relation_data)}
+
+            elif isinstance(field, HyperlinkedMixin):
+                relation_links = field.get_links(
+                    instance, field.related_link_lookup_field
                 )
-                continue
 
-            relation_data = {}
-            if isinstance(field, HyperlinkedMixin):
-                field_links = field.get_links(
-                    resource_instance, field.related_link_lookup_field
-                )
-                relation_data.update({"links": field_links} if field_links else dict())
-                data.update({field_name: relation_data})
+                if isinstance(field, (ResourceRelatedField,)):
+                    if not isinstance(field, SkipDataMixin):
+                        relation_data = resource.get(field_name)
 
-            if isinstance(field, (ResourceRelatedField,)):
-                if not isinstance(field, SkipDataMixin):
-                    relation_data.update({"data": resource.get(field_name)})
+                        if isinstance(field, ManySerializerMethodResourceRelatedField):
+                            relation_meta = {"count": len(resource.get(field_name))}
 
-                    if isinstance(field, ManySerializerMethodResourceRelatedField):
-                        relation_data.update(
-                            {"meta": {"count": len(resource.get(field_name))}}
-                        )
-
-                data.update({field_name: relation_data})
-                continue
-
-            if isinstance(
+            elif isinstance(
                 field,
                 (relations.PrimaryKeyRelatedField, relations.HyperlinkedRelatedField),
             ):
                 resolved, relation = get_relation_instance(
-                    resource_instance, f"{source}_id", field.parent
+                    instance, f"{source}_id", field.parent
                 )
                 if not resolved:
                     continue
                 relation_id = relation if resource.get(field_name) else None
-                relation_data = {"data": None}
                 if relation_id is not None:
-                    relation_data["data"] = {
+                    relation_data = {
                         "type": relation_type,
                         "id": force_str(relation_id),
                     }
@@ -181,66 +195,82 @@ class JSONRenderer(renderers.JSONRenderer):
                 if isinstance(
                     field, relations.HyperlinkedRelatedField
                 ) and resource.get(field_name):
-                    relation_data.update(
-                        {"links": {"related": resource.get(field_name)}}
-                    )
-                data.update({field_name: relation_data})
-                continue
+                    relation_links = {"related": resource.get(field_name)}
 
-            if isinstance(field, relations.ManyRelatedField):
+            elif isinstance(field, relations.ManyRelatedField):
                 resolved, relation_instance = get_relation_instance(
-                    resource_instance, source, field.parent
+                    instance, source, field.parent
                 )
                 if not resolved:
                     continue
 
-                relation_data = {}
-
-                if isinstance(resource.get(field_name), Iterable):
-                    relation_data.update(
-                        {"meta": {"count": len(resource.get(field_name))}}
-                    )
-
-                if isinstance(field.child_relation, ResourceRelatedField):
-                    # special case for ResourceRelatedField
-                    relation_data.update({"data": resource.get(field_name)})
-
                 if isinstance(field.child_relation, HyperlinkedMixin):
-                    field_links = field.child_relation.get_links(
-                        resource_instance,
+                    if isinstance(resource.get(field_name), Iterable):
+                        relation_meta = {"count": len(resource.get(field_name))}
+
+                    if isinstance(field.child_relation, ResourceRelatedField):
+                        # special case for ResourceRelatedField
+                        relation_data = resource.get(field_name)
+
+                    relation_links = field.child_relation.get_links(
+                        instance,
                         field.child_relation.related_link_lookup_field,
                     )
-                    relation_data.update(
-                        {"links": field_links} if field_links else dict()
-                    )
+                else:
+                    relation_data = list()
+                    for nested_resource_instance in relation_instance:
+                        nested_resource_instance_type = (
+                            relation_type
+                            or get_resource_type_from_instance(nested_resource_instance)
+                        )
 
-                    data.update({field_name: relation_data})
+                        relation_data.append(
+                            {
+                                "type": nested_resource_instance_type,
+                                "id": force_str(nested_resource_instance.pk),
+                            }
+                        )
+                    relation_meta = {"count": len(relation_data)}
+
+            data[field_name] = {}
+            if relation_meta:
+                data[field_name]["meta"] = relation_meta
+            if not isinstance(field, SkipDataMixin):
+                data[field_name]["data"] = relation_data
+            if relation_links:
+                data[field_name]["links"] = relation_links
+
+            if relation_data and cls.should_include(included_resources, field_name):
+                many = isinstance(relation_data, list)
+                if many:
+                    if all(included_cache.check(d) for d in relation_data):
+                        continue
+                elif included_cache.check(relation_data):
                     continue
 
-                relation_data = list()
-                for nested_resource_instance in relation_instance:
-                    nested_resource_instance_type = (
-                        relation_type
-                        or get_resource_type_from_instance(nested_resource_instance)
-                    )
+                if relation_instance is None:
+                    relation_instance = cls.extract_relation_instance(field, instance)
+                    if relation_instance is None:
+                        continue
 
-                    relation_data.append(
-                        {
-                            "type": nested_resource_instance_type,
-                            "id": force_str(nested_resource_instance.pk),
-                        }
-                    )
-                data.update(
-                    {
-                        field_name: {
-                            "data": relation_data,
-                            "meta": {"count": len(relation_data)},
-                        }
-                    }
+                serializer_class = included_serializers[field_name]
+
+                cls.extract_included(
+                    relation_instance,
+                    cls.unprefix_included_for_field(included_resources, field_name),
+                    included_cache,
+                    serializer_class,
+                    many,
+                    serializer.context,
                 )
-                continue
 
         return format_field_names(data)
+
+    @classmethod
+    def should_include(cls, included_resources, field_name):
+        return field_name in included_resources or any(
+            n.startswith(f"{field_name}.") for n in included_resources
+        )
 
     @classmethod
     def extract_relation_instance(cls, field, resource_instance):
@@ -259,139 +289,43 @@ class JSONRenderer(renderers.JSONRenderer):
             return None
 
     @classmethod
+    def unprefix_included_for_field(cls, included_resources, field_name):
+        prefix = f"{field_name}."
+        return [
+            key[len(prefix) :] for key in included_resources if key.startswith(prefix)
+        ]
+
+    @classmethod
     def extract_included(
-        cls, fields, resource, resource_instance, included_resources, included_cache
+        cls,
+        relation_instance,
+        included_resources,
+        included_cache,
+        serializer_class,
+        many,
+        context,
     ):
-        """
-        Adds related data to the top level included key when the request includes
-        ?include=example,example_field2
-        """
-        # this function may be called with an empty record (example: Browsable Interface)
-        if not resource_instance:
+        if isinstance(relation_instance, Manager):
+            # TODO Does this ever happen? It's not covered by tests.
+            relation_instance = list(relation_instance.all())
+        elif many:
+            relation_instance = list(relation_instance)
+
+        serializer = serializer_class(relation_instance, many=many, context=context)
+        serializer_data = serializer.data
+
+        if not serializer_data:
             return
 
-        current_serializer = fields.serializer
-        context = current_serializer.context
-        included_serializers = getattr(
-            current_serializer, "included_serializers", dict()
+        relation_type = get_resource_type_from_serializer(serializer_class)
+
+        cls.convert_serializer_data_to_json_api(
+            serializer,
+            serializer_data,
+            relation_type,
+            included_cache,
+            included_resources,
         )
-        included_resources = copy.copy(included_resources)
-
-        for field_name, field in iter(fields.items()):
-            # Skip URL field
-            if field_name == api_settings.URL_FIELD_NAME:
-                continue
-
-            # Skip fields without relations
-            if not is_relationship_field(field):
-                continue
-
-            try:
-                included_resources.remove(field_name)
-            except ValueError:
-                # Skip fields not in requested included resources
-                # If no child field, directly continue with the next field
-                if field_name not in [
-                    node.split(".")[0] for node in included_resources
-                ]:
-                    continue
-
-            relation_instance = cls.extract_relation_instance(field, resource_instance)
-            if isinstance(relation_instance, Manager):
-                relation_instance = relation_instance.all()
-
-            serializer_data = resource.get(field_name)
-
-            if isinstance(field, relations.ManyRelatedField):
-                serializer_class = included_serializers[field_name]
-                field = serializer_class(relation_instance, many=True, context=context)
-                serializer_data = field.data
-
-            if isinstance(field, relations.RelatedField):
-                if relation_instance is None or not serializer_data:
-                    continue
-
-                many = field._kwargs.get("child_relation", None) is not None
-
-                if isinstance(field, ResourceRelatedField) and not many:
-                    already_included = (
-                        serializer_data["type"] in included_cache
-                        and serializer_data["id"]
-                        in included_cache[serializer_data["type"]]
-                    )
-
-                    if already_included:
-                        continue
-
-                serializer_class = included_serializers[field_name]
-                field = serializer_class(relation_instance, many=many, context=context)
-                serializer_data = field.data
-
-            new_included_resources = [
-                key.replace(f"{field_name}.", "", 1)
-                for key in included_resources
-                if field_name == key.split(".")[0]
-            ]
-
-            if isinstance(field, ListSerializer):
-                serializer = field.child
-                relation_type = get_resource_type_from_serializer(serializer)
-                relation_queryset = list(relation_instance)
-
-                if serializer_data:
-                    for position in range(len(serializer_data)):
-                        serializer_resource = serializer_data[position]
-                        nested_resource_instance = relation_queryset[position]
-                        resource_type = (
-                            relation_type
-                            or get_resource_type_from_instance(nested_resource_instance)
-                        )
-                        serializer_fields = get_serializer_fields(
-                            serializer.__class__(
-                                nested_resource_instance, context=serializer.context
-                            )
-                        )
-                        new_item = cls.build_json_resource_obj(
-                            serializer_fields,
-                            serializer_resource,
-                            nested_resource_instance,
-                            resource_type,
-                            serializer,
-                            getattr(serializer, "_poly_force_type_resolution", False),
-                        )
-                        included_cache[new_item["type"]][new_item["id"]] = new_item
-
-                        cls.extract_included(
-                            serializer_fields,
-                            serializer_resource,
-                            nested_resource_instance,
-                            new_included_resources,
-                            included_cache,
-                        )
-
-            if isinstance(field, Serializer):
-                relation_type = get_resource_type_from_serializer(field)
-
-                # Get the serializer fields
-                serializer_fields = get_serializer_fields(field)
-                if serializer_data:
-                    new_item = cls.build_json_resource_obj(
-                        serializer_fields,
-                        serializer_data,
-                        relation_instance,
-                        relation_type,
-                        field,
-                        getattr(field, "_poly_force_type_resolution", False),
-                    )
-                    included_cache[new_item["type"]][new_item["id"]] = new_item
-
-                    cls.extract_included(
-                        serializer_fields,
-                        serializer_data,
-                        relation_instance,
-                        new_included_resources,
-                        included_cache,
-                    )
 
     @classmethod
     def extract_meta(cls, serializer, resource):
@@ -407,7 +341,7 @@ class JSONRenderer(renderers.JSONRenderer):
         data = {}
         for field_name in meta_fields:
             if field_name in resource:
-                data.update({field_name: resource[field_name]})
+                data[field_name] = resource[field_name]
         return data
 
     @classmethod
@@ -456,20 +390,19 @@ class JSONRenderer(renderers.JSONRenderer):
         cls,
         fields,
         resource,
-        resource_instance,
+        resource_id,
         resource_name,
+        instance,
         serializer,
-        force_type_resolution=False,
+        included_resources,
+        included_cache,
     ):
         """
         Builds the resource object (type, id, attributes) and extracts relationships.
         """
-        # Determine type from the instance if the underlying model is polymorphic
-        if force_type_resolution:
-            resource_name = get_resource_type_from_instance(resource_instance)
         resource_data = {
             "type": resource_name,
-            "id": get_resource_id(resource_instance, resource),
+            "id": resource_id,
         }
 
         # TODO remove this filter by rewriting extract_relationships
@@ -478,7 +411,9 @@ class JSONRenderer(renderers.JSONRenderer):
         attributes = cls.extract_attributes(fields, resource)
         if attributes:
             resource_data["attributes"] = attributes
-        relationships = cls.extract_relationships(fields, resource, resource_instance)
+        relationships = cls.extract_relationships(
+            serializer, fields, resource, instance, included_resources, included_cache
+        )
         if relationships:
             resource_data["relationships"] = relationships
         # Add 'self' link if field is present and valid
@@ -543,7 +478,7 @@ class JSONRenderer(renderers.JSONRenderer):
         json_api_data = data
         # initialize json_api_meta with pagination meta or an empty dict
         json_api_meta = data.get("meta", {}) if isinstance(data, dict) else {}
-        included_cache = defaultdict(dict)
+        included_cache = IncludedCache()
 
         if data and "results" in data:
             serializer_data = data["results"]
@@ -557,73 +492,13 @@ class JSONRenderer(renderers.JSONRenderer):
         if serializer is not None:
             # Extract root meta for any type of serializer
             json_api_meta.update(self.extract_root_meta(serializer, serializer_data))
-
-            if getattr(serializer, "many", False):
-                json_api_data = list()
-
-                for position in range(len(serializer_data)):
-                    resource = serializer_data[position]  # Get current resource
-                    resource_instance = serializer.instance[
-                        position
-                    ]  # Get current instance
-
-                    if isinstance(
-                        serializer.child,
-                        rest_framework_json_api.serializers.PolymorphicModelSerializer,
-                    ):
-                        resource_serializer_class = (
-                            serializer.child.get_polymorphic_serializer_for_instance(
-                                resource_instance
-                            )(context=serializer.child.context)
-                        )
-                    else:
-                        resource_serializer_class = serializer.child
-
-                    fields = get_serializer_fields(resource_serializer_class)
-                    force_type_resolution = getattr(
-                        resource_serializer_class, "_poly_force_type_resolution", False
-                    )
-
-                    json_resource_obj = self.build_json_resource_obj(
-                        fields,
-                        resource,
-                        resource_instance,
-                        resource_name,
-                        serializer,
-                        force_type_resolution,
-                    )
-                    json_api_data.append(json_resource_obj)
-
-                    self.extract_included(
-                        fields,
-                        resource,
-                        resource_instance,
-                        included_resources,
-                        included_cache,
-                    )
-            else:
-                fields = get_serializer_fields(serializer)
-                force_type_resolution = getattr(
-                    serializer, "_poly_force_type_resolution", False
-                )
-
-                resource_instance = serializer.instance
-                json_api_data = self.build_json_resource_obj(
-                    fields,
-                    serializer_data,
-                    resource_instance,
-                    resource_name,
-                    serializer,
-                    force_type_resolution,
-                )
-
-                self.extract_included(
-                    fields,
-                    serializer_data,
-                    resource_instance,
-                    included_resources,
-                    included_cache,
-                )
+            json_api_data = self.convert_serializer_data_to_json_api(
+                serializer,
+                serializer_data,
+                resource_name,
+                included_cache,
+                included_resources,
+            )
 
         # Make sure we render data in a specific order
         render_data = {}
@@ -638,32 +513,102 @@ class JSONRenderer(renderers.JSONRenderer):
         else:
             render_data["data"] = json_api_data
 
-        if included_cache:
+        if included_resources:
+            render_data["included"] = list()
+
+        if included_cache.by_id:
             if isinstance(json_api_data, list):
                 objects = json_api_data
             else:
                 objects = [json_api_data]
 
-            for object in objects:
-                obj_type = object.get("type")
-                obj_id = object.get("id")
-                if obj_type in included_cache and obj_id in included_cache[obj_type]:
-                    del included_cache[obj_type][obj_id]
-                if not included_cache[obj_type]:
-                    del included_cache[obj_type]
+            for obj in objects:
+                included_cache.remove(obj)
 
-        if included_resources:
-            render_data["included"] = list()
-            for included_type in sorted(included_cache.keys()):
-                for included_id in sorted(included_cache[included_type].keys()):
-                    render_data["included"].append(
-                        included_cache[included_type][included_id]
-                    )
+            if included_cache.by_id:
+                render_data["included"] = [
+                    included_cache.by_id[k] for k in sorted(included_cache.by_id)
+                ]
 
         if json_api_meta:
             render_data["meta"] = format_field_names(json_api_meta)
 
         return super().render(render_data, accepted_media_type, renderer_context)
+
+    @classmethod
+    def convert_serializer_data_to_json_api(
+        cls,
+        serializer,
+        serializer_data,
+        resource_name,
+        included_cache,
+        included_resources,
+        use_from_cache=True,
+    ):
+        json_api_data = list()
+        many = getattr(serializer, "many", False)
+
+        if many:
+            serializer_instance = serializer.instance
+            nested_serializer = serializer.child
+            context = serializer.child.context
+            is_polymorphic_serializer = getattr(
+                serializer.child, "_poly_force_type_resolution", False
+            )
+            if not is_polymorphic_serializer:
+                fields = get_serializer_fields(serializer.child)
+        else:
+            serializer_instance = [serializer.instance]
+            serializer_data = [serializer_data]
+            nested_serializer = serializer
+            fields = get_serializer_fields(serializer)
+            is_polymorphic_serializer = getattr(
+                serializer, "_poly_force_type_resolution", False
+            )
+
+        if is_polymorphic_serializer:
+            resource_name = None  # force resolving the name from instance
+
+        for position in range(len(serializer_data)):
+            resource = serializer_data[position]
+            resource_instance = serializer_instance[position]
+
+            if many and is_polymorphic_serializer:
+                resource_serializer_class = (
+                    serializer.child.get_polymorphic_serializer_for_instance(
+                        resource_instance
+                    )
+                )
+                nested_serializer = resource_serializer_class(
+                    resource_instance,
+                    context=context,
+                )
+                fields = get_serializer_fields(nested_serializer)
+
+            resolved_resource_name = resource_name or get_resource_type_from_instance(
+                resource_instance
+            )
+            resource_id = get_resource_id(resource_instance, resource)
+
+            if use_from_cache and (
+                already_built := included_cache.get(resolved_resource_name, resource_id)
+            ):
+                json_api_data.append(already_built)
+            else:
+                json_resource_obj = cls.build_json_resource_obj(
+                    fields,
+                    resource,
+                    resource_id,
+                    resolved_resource_name,
+                    resource_instance,
+                    nested_serializer,
+                    included_resources,
+                    included_cache,
+                )
+                json_api_data.append(json_resource_obj)
+                included_cache.add(json_resource_obj)
+
+        return json_api_data if many else json_api_data[0]
 
 
 class BrowsableAPIRenderer(renderers.BrowsableAPIRenderer):
